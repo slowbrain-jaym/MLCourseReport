@@ -1,0 +1,213 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Jamie Davidson"
+date: "27/10/2020"
+output: html_document
+---
+
+## Summary
+Data captured by a set of accelerometers on deadlifters was used to train and optimised a selection of machine learning methods. The aim of these methods was to recognise whether the correct lifting form had been observed, additionally recognising the specific type of incorrect form used if applicable. The final model chosen was a Random Forest with 1000 trees and an mtry value of 2. The out of sample error for the model is estimated to be 96.4%.
+
+## Loading and Tidying the Data
+First the packages required for the project are loaded and the random seed is set for reproducibility.
+
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(doParallel)
+library(caret)
+library(ggplot2)
+library(mlbench)
+
+set.seed(133456)
+```
+
+
+Next we load the entirety of the dataset into R.
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+alldata<-read.csv("pml-training.csv")
+```
+
+The next step is tidying the data and preparing to apply the preproccessing and machine learning algorithms to it. The "user_name" variable, containing the name of the deadlifter is a character variable, which is incompatible with a number of machine learning algorithms. To get around this while preserving the information of who is lifting, a set of dummy variables is used. The "classe" variable which describes in what way the deadlift was performed is also converted to a factor.
+
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+user_dmy<-dummyVars(~as.factor(user_name), data=alldata)
+user_dmyDF<-predict(user_dmy, alldata)
+alldata<-select(alldata, -user_name)
+alldata<-merge(user_dmyDF, alldata, by=0, all=TRUE)
+alldata$classe<-as.factor(alldata$classe)
+```
+
+Next, a large number of columns in the dataset contain a very large number of "NA" or empty values only being used to store summary statistics. These are excluded from the analysis as the data set on which predictions need to be made does not include them.
+
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+alldata<-alldata[,!colSums(is.na(alldata))>0]
+alldata<-alldata[,!colSums(alldata=="")>0]
+```
+
+Finally, columns that will not be useful in predicting the method of lifting outside this specific dataset are removed. These columns and the logic for removing them are as follows:
+
+* Row.names - This is an artifact of the merge operation that added dummy variables to the dataset.
+* X - the index of the dataset will have no predictive power when applied to new pieces of information.
+* new_window - new window is a boolean variable that denotes the start and end of a new session and indicates the row contains summary statistics. As none of the entries in the set for which predictions need to be made include summary statistics this column is not required.
+* Time variables (raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, num_window) - the time of day that the training data was captured has no predictive power on other datasets as is shown in the plot below.
+
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+plot<-ggplot(data=alldata, aes(y=classe, x=cvtd_timestamp))
+plot+geom_point()
+alldata<-select(alldata, c(-Row.names, -X, 
+                -new_window, -raw_timestamp_part_1, 
+                -raw_timestamp_part_2, -cvtd_timestamp,
+                -num_window))
+```
+
+## Preprocessing
+First the dataset is split into three parts, a test set for estimating the out of sample error of the final predictor chosen, a validation set for intermediate testing of predictors, and a training set for training the predictors. Data is allocated 20% to the testing and validation sets and 60% to the training set.
+
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+inTest<-createDataPartition(alldata$classe, p=0.25, list=FALSE)
+testing<-alldata[inTest,]
+training<-alldata[-inTest,]
+inVal<-createDataPartition(training$classe, p=0.2, list=FALSE)
+val<-training[inVal,]
+training<-training[-inVal,]
+dim(training)
+```
+This gives us a training set with 12554 rows and 59 columns, one of which being "classe" which we would like to predict. 59 columns is a high number and if we apply our learning algorithms to this set with no modification it will be computationally wasteful.
+
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+BoxCoxProc<-preProcess(x=training[-59], method=c("BoxCox", "center", "scale"))
+PCAComp<-prcomp(predict(BoxCoxProc, training[-59]))
+summary(PCAComp)
+```
+The code chunk above first attempts to make each variable as normally distributed as possible, with mean 0 and standard deviation 1. Once this is complete the "prcomp()" function compares the proportion and cumulative amount of variance in the entire dataset that can be captured by principle component analysis with a variable number of components. The printed table shows that 90% of the total variability of the data can be explained with 19 principle components. This operation has the added benefit of helping to prevent overfitting.
+
+Generating the preprocessed training, test and validation set.
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+preprocessor<-preProcess(x=training[-59], method=c("BoxCox", "center", "scale","pca"), thresh=0.9)
+trainPC<-predict(preprocessor, training[-59])
+trainPC$classe<-training$classe
+valPC<-predict(preprocessor, val[-59])
+valPC$classe<-val$classe
+testPC<-predict(preprocessor, testing[-59])
+testPC$classe<-testing$classe
+```
+
+
+## Model Training
+
+First, a selection of common classification algorithms are trained to give an idea of which algorithms will be most useful. The chosen models are:
+* Random Forest
+* Boosted Logistic Regression
+* Linear Discriminant Analysis
+* A Support vector Machine
+* The C5.0 decision tree model
+
+Parallel computing is used to accelerate the training process.
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+no_cores <- detectCores()-2
+cl<-makeCluster(no_cores)
+registerDoParallel(cl)  
+ 
+modelFitRF<-train(classe~.,method="rf",data=trainPC)
+modelFitLB<-train(classe~.,method="LogitBoost",data=trainPC)
+modelFitLDA<-train(classe~.,method="lda",data=trainPC)
+modelFitSVM<-train(classe~.,method="svmRadial",data=trainPC)
+modelFitC5<-train(classe~.,method="C5.0",data=trainPC)
+stopCluster(cl)
+```
+
+The accuracy of the models on the training set are then as follows:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+confusionMatrix(modelFitRF)
+confusionMatrix(modelFitLB)
+confusionMatrix(modelFitLDA)
+confusionMatrix(modelFitSVM)
+confusionMatrix(modelFitC5)
+```
+The two best performing algorithms are the random forest and C5.0 decision tree models, both boasting an accuracy of over 90%. Examining both models in more detail:
+
+### C5.0 Model
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+print(modelFitC5)
+```
+The automatic tuning of the hyperparameters shows that the rules based model achieves higher accuracy, as does increased number of trials. The effect of winnowing appears minimal. The effect of increasing the number of trails and winoowing can be investigated using a tuning grid:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+no_cores <- detectCores()-2
+cl<-makeCluster(no_cores)
+registerDoParallel(cl) 
+fitControl<-trainControl(method="repeatedcv",number=10,repeats=10,returnResamp = "all")
+grid <- expand.grid(.winnow = TRUE, .trials=c(15,20,25), .model="rules" )
+modelFitC5_tuning<- train(classe~., data=trainPC,tuneGrid=grid,trControl=fitControl,method="C5.0",verbose=FALSE)
+stopCluster(cl)
+```
+Visualising the tuning results:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+plot(modelFitC5_tuning)
+```
+The plot shows that increasing the number of boosting iterations increases the accuracy of the model, but not very significantly, with an increase of 15 to 25 giving only a 0.5% increase in accuracy. 25 boosting iterations will be used in the final version of the C5.0 algorithm for this project.
+
+### Random Forest Model
+Printing the hyperparameter tuning of the random forest model:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+print(modelFitRF)
+```
+The automatic tuning indicates that varying the "mtry" variable may have little effect on the accuracy, we can examine this in more detail however, as well as examining the effect of the number of trees used in the model.
+
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+no_cores <- detectCores()-2
+cl<-makeCluster(no_cores)
+registerDoParallel(cl) 
+fitControl<-trainControl(method="repeatedcv",number=10,repeats=10,returnResamp = "all")
+grid <- expand.grid(.mtry=c(2,3,4,5))
+modelFitRF_tuning500<- train(classe~., data=trainPC,tuneGrid=grid,trControl=fitControl,method="rf",verbose=FALSE,ntree=500)
+modelFitRF_tuning1000<- train(classe~., data=trainPC,tuneGrid=grid,trControl=fitControl,method="rf",verbose=FALSE,ntree=1000)
+stopCluster(cl)
+```
+
+Visualising the results:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+par(mfrow=c(1,2))
+plot(modelFitRF_tuning500)
+plot(modelFitRF_tuning1000)
+```
+
+The plots shows that the mtry variable is already well optimised by the built in methods with a value of 2. Using 1000 trees gives slightly higher accuracy than 500 tree model.
+
+### Final Model Selection
+
+Comparing the two models on the validation set:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+RF_predictions<-predict(modelFitRF_tuning1000, newdata = valPC[-19])
+C5_predictions<-predict(modelFitC5_tuning, newdata = valPC[-19])
+confusionMatrix(C5_predictions, valPC$classe)$overall["Accuracy"]
+confusionMatrix(RF_predictions, valPC$classe)$overall["Accuracy"]
+```
+The random forest model is used going forwards as it has a higher accuracy of 96.6% on the validation set.
+
+### Out of sample error:
+Using the test set to estimate the out of sample error:
+```{r cache=TRUE, echo = TRUE, message=FALSE}
+RF_predictions<-predict(modelFitRF_tuning1000, newdata = testPC[-19])
+confusionMatrix(RF_predictions, testPC$classe)$overall["Accuracy"]
+```
+
+
+### Predictions for Quiz
+```{r cache=FALSE, echo = TRUE, message=FALSE}
+quizdata<-read.csv("pml-testing.csv")
+user_dmy<-dummyVars(~as.factor(user_name), data=quizdata)
+user_dmyDF<-predict(user_dmy, quizdata)
+quizdata<-select(quizdata, -user_name)
+quizdata<-merge(user_dmyDF, quizdata, by=0, all=TRUE)
+quizdata<-quizdata[,!colSums(is.na(quizdata))>0]
+quizdata<-quizdata[,!colSums(quizdata=="")>0]
+quizdata<-select(quizdata, c(-Row.names, -X, 
+                -new_window, -raw_timestamp_part_1, 
+                -raw_timestamp_part_2, -cvtd_timestamp,
+                -num_window))
+quizPC<-predict(preprocessor, quizdata[-59])
+quizPredictions<-predict(modelFitRF_tuning1000, quizPC)
+quizPredictions<-data.frame(id=quizdata$problem_id, prediction=quizPredictions)
+print(quizPredictions)
+```
